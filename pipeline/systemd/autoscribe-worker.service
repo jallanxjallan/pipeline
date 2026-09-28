@@ -1,0 +1,15 @@
+[Unit]
+Description=AutoScribe local extension worker
+After=redis-server.service autoscribe-executor.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/autoscribe/autoscribe.env
+ExecStart=/opt/autoscribe/.venv/bin/python /opt/autoscribe/app/daemon/workerd.py
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

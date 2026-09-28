@@ -1,0 +1,12 @@
+
+# Generated build and test state
+/target/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+coverage/
+.DS_Store
+
+# Local migration backups and generated metadata
+/.overlay-backup-*/

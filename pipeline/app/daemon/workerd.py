@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from autoscribe.ledger import record_response
+from autoscribe.redis_runtime import FORENSIC_TTL, WORKER_QUEUE_KEY, RedisClient
+from autoscribe.worker import execute_task, load_registry, persist_redis_response
+
+HOME = Path.home()
+LEDGER_DB = Path(os.environ.get("AUTOSCRIBE_LEDGER_DB", str(HOME / "Data/ledger.sql")))
+REGISTRY = Path(os.environ.get("AUTOSCRIBE_EXTENSION_REGISTRY", "/opt/autoscribe/extensions/registry.json"))
+REDIS_HOST = os.environ.get("AUTOSCRIBE_REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.environ.get("AUTOSCRIBE_REDIS_PORT", "6379"))
+POLL_SECONDS = float(os.environ.get("AUTOSCRIBE_WORKER_POLL_SECONDS", "1"))
+TIMEOUT_SECONDS = float(os.environ.get("AUTOSCRIBE_EXTENSION_TIMEOUT_SECONDS", "30"))
+ASC = Path(os.environ.get("AUTOSCRIBE_ASC", str(HOME / ".local/bin/asc")))
+running = True
+
+
+def emit(event: str, **fields) -> None:
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False, sort_keys=True), flush=True)
+
+
+def stop(*_args) -> None:
+    global running
+    running = False
+
+
+def process_ready(client: RedisClient, registry: dict[str, Path]) -> None:
+    for task_key in client.zrange(WORKER_QUEUE_KEY, 0, 31):
+        client.zrem(WORKER_QUEUE_KEY, task_key)
+        call_id = None
+        try:
+            task = client.hgetall(task_key)
+            call_id = task.get("call_id") if task else None
+            result = execute_task(client, task_key, registry, TIMEOUT_SECONDS)
+            response_key = persist_redis_response(client, result)
+            created = record_response(LEDGER_DB, result.call_id, response_key)
+            emit(
+                "worker_completed",
+                call_id=result.call_id,
+                task_key=task_key,
+                response_key=response_key,
+                executor=result.executor,
+                entrypoint=result.entrypoint,
+                created=created,
+            )
+            notice = subprocess.run(
+                [str(ASC), "export"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if notice.returncode != 0:
+                emit(
+                    "export_notice_failed",
+                    call_id=result.call_id,
+                    error=notice.stderr.strip() or f"asc export exited {notice.returncode}",
+                )
+        except Exception as exc:
+            if call_id:
+                diagnostic_key = f"diagnostic:{call_id}:worker"
+                client.hset(diagnostic_key, {"task_key": task_key, "error": str(exc)})
+                client.expire(diagnostic_key, FORENSIC_TTL)
+            else:
+                diagnostic_key = None
+            emit("worker_failed", call_id=call_id, task_key=task_key, diagnostic_key=diagnostic_key, error=str(exc))
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    registry = load_registry(REGISTRY)
+    client = RedisClient(REDIS_HOST, REDIS_PORT)
+    client.ping()
+    emit("ready", registry=str(REGISTRY), extensions=sorted(registry), redis=f"{REDIS_HOST}:{REDIS_PORT}")
+    while running:
+        process_ready(client, registry)
+        time.sleep(POLL_SECONDS)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

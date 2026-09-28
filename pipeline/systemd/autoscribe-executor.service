@@ -1,0 +1,14 @@
+[Unit]
+Description=AutoScribe executor coordinator
+After=redis-server.service autoscribe-dispatch.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/autoscribe/autoscribe.env
+ExecStart=/opt/autoscribe/.venv/bin/python /opt/autoscribe/app/daemon/executord.py
+Restart=on-failure
+RestartSec=2
+MemoryMax=256M
+
+[Install]
+WantedBy=default.target

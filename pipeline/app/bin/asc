@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+APP_ROOT = Path(__file__).resolve().parents[1]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from autoscribe.control import list_plans
+from autoscribe.exporter import iter_pending_ndjson, poke_responses, response_content
+from autoscribe.redis_runtime import RedisClient
+
+
+def ledger_path() -> Path:
+    return Path(os.environ.get("AUTOSCRIBE_LEDGER_DB", str(Path.home() / "Data/ledger.sql")))
+
+
+def redis_client() -> RedisClient:
+    host = os.environ.get("AUTOSCRIBE_REDIS_HOST", "127.0.0.1")
+    port = int(os.environ.get("AUTOSCRIBE_REDIS_PORT", "6379"))
+    return RedisClient(host, port)
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args == ["control", "plans"]:
+        db = Path(os.environ.get("AUTOSCRIBE_CONTROL_DB", str(Path.home() / "Data/control.sql")))
+        for row in list_plans(db):
+            print(f"{row['label']}\t{row['id']}")
+        return 0
+    if args == ["export"]:
+        socket_path = Path(
+            os.environ.get(
+                "AUTOSCRIBE_RESPONSE_SOCKET",
+                str(Path.home() / ".local/run/autoscribe/response.sock"),
+            )
+        )
+        try:
+            count = poke_responses(ledger_path(), socket_path)
+        except Exception as exc:
+            print(f"asc export: {exc}", file=sys.stderr)
+            return 1
+        print(count)
+        return 0
+    if args == ["export", "pending"]:
+        for line in iter_pending_ndjson(ledger_path(), redis_client()):
+            print(line)
+        return 0
+    if len(args) == 3 and args[:2] == ["export", "content"]:
+        try:
+            content = response_content(ledger_path(), redis_client(), args[2])
+        except Exception as exc:
+            print(f"asc export content: {exc}", file=sys.stderr)
+            return 1
+        sys.stdout.write(content)
+        return 0
+    print(
+        "usage: asc control plans | asc export | asc export pending | asc export content <call-id>",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
