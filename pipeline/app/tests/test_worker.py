@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from autoscribe.redis_runtime import materialize_call
-from autoscribe.worker import WorkerError, execute_task, persist_redis_response, run_extension
+from autoscribe.worker import WorkerError, execute_task, persist_step_result, run_chatgpt, run_extension
 
 
 class FakeRedis:
@@ -18,37 +21,25 @@ class FakeRedis:
 
 
 class WorkerTests(unittest.TestCase):
-    def test_extension_prepends_seen(self):
+    def test_script_step_reads_first_call_input(self):
         with tempfile.TemporaryDirectory() as td:
             script = Path(td) / "prepend.py"
-            script.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('I have seen this\\n\\n'+sys.stdin.read())\n")
+            script.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('SEEN:'+sys.stdin.read())\n")
             script.chmod(0o755)
-            self.assertEqual(run_extension(script, "Body\n"), "I have seen this\n\nBody\n")
+            redis = FakeRedis()
+            content = {"input": {"content": "Hello"}, "plan": {"steps": [{"position": 1, "engine_kind": "script", "engine": "local", "script": "prepend", "args": {}, "instructions": []}]}}
+            call = materialize_call(redis, "01", content, {"autoscribe_return": {}})
+            redis.hset("task:01:1", {"call_id": "01", "content_key": call.content_key, "ordinal": 1, "engine_kind": "script", "engine": "local", "entrypoint": "prepend"})
+            result = execute_task(redis, "task:01:1", {"prepend": script})
+            self.assertEqual(result.content, "SEEN:Hello")
+            key = persist_step_result(redis, result)
+            self.assertEqual(redis.hashes[key]["content"], "SEEN:Hello")
 
-    def test_execute_task_loads_input_from_content_key(self):
-        with tempfile.TemporaryDirectory() as td:
-            script = Path(td) / "extension.py"
-            script.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('I have seen this\\n\\n'+sys.stdin.read())\n")
-            script.chmod(0o755)
-            r = FakeRedis()
-            content = {"schema": "autoscribe.call-content.v1", "input": {"content": "Hello\n", "directive": None}, "plan": {}}
-            baggage = {"schema": "autoscribe.call-baggage.v1", "source": {}, "output": {}}
-            call = materialize_call(r, "01", content, baggage)
-            r.hset("task:01:1", {"call_id": "01", "content_key": call.content_key, "engine": "extension", "entrypoint": "prepend-seen", "ordinal": 1})
-            result = execute_task(r, "task:01:1", {"prepend-seen": script})
-            self.assertEqual(result.content, "I have seen this\n\nHello\n")
-            response_key = persist_redis_response(r, result)
-            self.assertEqual(response_key, "response:01:content")
-            self.assertEqual(r.hashes[response_key]["content"], result.content)
-
-    def test_unregistered_extension_rejected(self):
-        r = FakeRedis()
-        content = {"schema": "autoscribe.call-content.v1", "input": {"content": "x", "directive": None}, "plan": {}}
-        baggage = {"schema": "autoscribe.call-baggage.v1", "source": {}, "output": {}}
-        call = materialize_call(r, "01", content, baggage)
-        r.hset("task:01:1", {"call_id": "01", "content_key": call.content_key, "engine": "extension", "entrypoint": "arbitrary/path", "ordinal": 1})
-        with self.assertRaisesRegex(WorkerError, "unregistered extension"):
-            execute_task(r, "task:01:1", {})
+    def test_missing_openai_key_is_explicit(self):
+        step = {"engine_kind": "llm", "engine": "chatgpt", "model": "luna", "args": {}, "instructions": []}
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(WorkerError, "OPENAI_API_KEY"):
+                run_chatgpt(step, "hello")
 
 
 if __name__ == "__main__": unittest.main()
