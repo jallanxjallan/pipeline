@@ -143,6 +143,23 @@ def load_response(path: Path, call_id: str) -> dict:
     return dict(row)
 
 
+def latest_response_id(path: Path) -> str:
+    """Return the newest recorded response identity."""
+    ensure_schema(path)
+    with closing(connect(path)) as db, db:
+        row = db.execute(
+            """
+            SELECT call_id
+            FROM responses
+            ORDER BY created_at DESC, call_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if row is None:
+        raise LedgerError("no responses recorded")
+    return str(row["call_id"])
+
+
 def pending_exports(path: Path) -> list[dict]:
     """Return responses that exist as facts but have no export fact yet."""
     ensure_schema(path)

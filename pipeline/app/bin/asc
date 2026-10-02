@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -13,7 +14,8 @@ if str(APP_ROOT) not in sys.path:
 from autoscribe.control import list_plans
 from autoscribe.enqueue import enqueue_record
 from autoscribe.exporter import iter_pending_ndjson, poke_responses, response_content
-from autoscribe.ledger import load_call_keys, load_response
+from autoscribe.ids import new_ulid
+from autoscribe.ledger import latest_response_id, load_call_keys, load_response
 from autoscribe.redis_runtime import RedisClient, load_json
 
 
@@ -29,6 +31,109 @@ def redis_client() -> RedisClient:
     host = os.environ.get("AUTOSCRIBE_REDIS_HOST", "127.0.0.1")
     port = int(os.environ.get("AUTOSCRIBE_REDIS_PORT", "6379"))
     return RedisClient(host, port)
+
+
+def services_bin_dir() -> Path:
+    return Path(
+        os.environ.get(
+            "AUTOSCRIBE_SERVICES_BIN",
+            "/opt/autoscribe/services/current/bin",
+        )
+    )
+
+
+def services_policy_path() -> Path:
+    return Path(
+        os.environ.get(
+            "AUTOSCRIBE_SERVICES_POLICY",
+            "/etc/autoscribe/services.toml",
+        )
+    )
+
+
+def run_service(name: str, *args: str, input_text: str) -> str:
+    binary = services_bin_dir() / name
+    try:
+        proc = subprocess.run(
+            [
+                str(binary),
+                "--policy",
+                str(services_policy_path()),
+                *args,
+            ],
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"service binary not found: {binary}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"{name} failed: {detail}")
+    return proc.stdout
+
+
+def one_ndjson_record(text: str, label: str) -> dict:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RuntimeError(f"{label} returned {len(lines)} records; expected exactly one")
+    try:
+        value = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{label} returned invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} returned a non-object record")
+    return value
+
+
+def force_export(call_id_arg: str) -> dict:
+    call_id = (
+        latest_response_id(ledger_path())
+        if call_id_arg == "--latest"
+        else call_id_arg
+    )
+    response = response_record(call_id)
+    replay_id = f"rpl_{new_ulid()}"
+    response_ndjson = (
+        json.dumps(
+            response,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+    effect_ndjson = run_service(
+        "srv-output",
+        "--replay-id",
+        replay_id,
+        input_text=response_ndjson,
+    )
+    effect_record = one_ndjson_record(effect_ndjson, "srv-output")
+    effect = effect_record.get("effect")
+    if not isinstance(effect, dict):
+        raise RuntimeError("srv-output returned no effect object")
+
+    kind = effect.get("kind")
+    if kind == "repo":
+        sink = "srv-writeback"
+    elif kind == "dropbox":
+        sink = "srv-export"
+    else:
+        raise RuntimeError(f"unsupported replay effect kind: {kind!r}")
+
+    receipt_ndjson = run_service(sink, input_text=effect_ndjson)
+    receipt = one_ndjson_record(receipt_ndjson, sink)
+    return {
+        "schema": "autoscribe.reexport-result.v1",
+        "call_id": call_id,
+        "replay_id": replay_id,
+        "effect_key": effect_record.get("effect_key"),
+        "receipt": receipt,
+    }
 
 
 def enqueue_stdin() -> int:
@@ -113,6 +218,21 @@ def main() -> int:
             return 1
         print(count)
         return 0
+    if len(args) == 3 and args[:2] == ["export", "force"]:
+        try:
+            result = force_export(args[2])
+        except Exception as exc:
+            print(f"asc export force: {exc}", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
     if args == ["export", "pending"]:
         for line in iter_pending_ndjson(ledger_path(), redis_client()):
             print(line)
@@ -127,7 +247,8 @@ def main() -> int:
         return 0
     print(
         "usage: asc control plans | asc enqueue | asc response <call-id> | "
-        "asc export | asc export pending | asc export content <call-id>",
+        "asc export | asc export force <call-id|--latest> | "
+        "asc export pending | asc export content <call-id>",
         file=sys.stderr,
     )
     return 2

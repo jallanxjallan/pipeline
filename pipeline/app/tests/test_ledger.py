@@ -6,6 +6,7 @@ from pathlib import Path
 from autoscribe.ledger import (
     LedgerError,
     ensure_schema,
+    latest_response_id,
     load_call_keys,
     pending_exports,
     record_call,
@@ -37,6 +38,15 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(load_call_keys(path, "01TEST"), keys)
             with self.assertRaises(LedgerError):
                 record_call(path, "01TEST", {"content": "other", "baggage": keys["baggage"]})
+
+    def test_latest_response_id_returns_newest_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.sql"
+            record_call(path, "01FIRST", {"content": "c1", "baggage": "b1"})
+            record_response(path, "01FIRST", "r1")
+            record_call(path, "01SECOND", {"content": "c2", "baggage": "b2"})
+            record_response(path, "01SECOND", "r2")
+            self.assertEqual(latest_response_id(path), "01SECOND")
 
     def test_response_and_export_are_relational_facts(self):
         with tempfile.TemporaryDirectory() as tmp:
